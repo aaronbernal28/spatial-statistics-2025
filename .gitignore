@@ -205,3 +205,6 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+data/query_train.csv
+data/test_earthquakes.csv
+data/query_test_100_100_2.pt
