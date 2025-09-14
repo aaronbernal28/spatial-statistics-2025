@@ -2,15 +2,11 @@ import argparse
 import random
 import numpy as np
 import pandas as pd
-from codebase.utils import save_samples
 from shapely.geometry import Point
 from shapely.ops import transform
 import pyproj
 import random
 from typing import List, Tuple
-import torch
-
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 Y_MIN = -40.98
 Y_MAX = -12.983
@@ -34,7 +30,7 @@ def generate_circular_subsets(df: pd.DataFrame,
     num_subsets : int
     min_points_per_subset : int
 
-    Output: List[pd.DataFrame] cada DataFrame contiene eventos dentro de un circunferencia aleatoria
+    Output: pd.DataFrame eventos dentro de un circunferencia aleatoria indexados
     """
 
     # Bounding box
@@ -59,11 +55,12 @@ def generate_circular_subsets(df: pd.DataFrame,
     project_to_utm = pyproj.Transformer.from_crs(wgs84, utm, always_xy=True).transform
     points_utm = [transform(project_to_utm, point) for point in points_geo]
     
-    output = []
+    output = pd.DataFrame(columns=['x', 'y', 'z', 't', 'm','idx_rad', 'idx_time'])
     attempts = 0
     max_attempts = num_subsets * 10  # Cota superior
-    
-    while len(output) < num_subsets and attempts < max_attempts:
+    j = 0
+
+    while j < num_subsets and attempts < max_attempts:
         attempts += 1
         
         # Generar un punto central aleatorio dentro de los límites
@@ -86,19 +83,19 @@ def generate_circular_subsets(df: pd.DataFrame,
         
         if len(indices_in_circle) >= min_points_per_subset:
             subset_df = df.iloc[indices_in_circle].copy()
-            
+            subset_df['idx_rad'] = j
             # Tiempo relativo al t_start
             subset_df[t_col] = subset_df[t_col] - t_start
-            
-            output.append(subset_df)
-    
-    if len(output) < num_subsets:
-        print(f"Warning: Only generated {len(output)} subsets out of {num_subsets} requested.")
-        print(f"Consider increasing the area bounds, decreasing radius, or lowering min_points_per_subset.")
-    
-    return output
 
-def samples(filepath, samples=10000, radius_km=100, time_intervals=100, random_seed = 28):
+            if output.empty:
+                output = subset_df
+            else:
+                output = pd.concat([output, subset_df], ignore_index=True)
+            j += 1
+
+    return output, j
+
+def samples(filepath, samples_per_interval=100, radius_km=200, time_intervals=100, random_seed = 28):
     '''
     Genera *samples* muestras tomadas al azar de radio 10 dentro del bounding box
     los intervalos de tiempo son disjuntos
@@ -110,7 +107,7 @@ def samples(filepath, samples=10000, radius_km=100, time_intervals=100, random_s
     np.random.seed(random_seed)
     
     df = pd.read_csv(filepath)
-    df['time'] = pd.to_numeric(pd.to_datetime(df["time"])) / 10**9 # ns a s
+    df['time'] = pd.to_numeric(pd.to_datetime(df["time"])) / (10**9 * 3600) # ns to hours units
     df = df[['longitude', 'latitude', 'depth', 'time', 'mag']]
     df.columns = ['x', 'y', 'z', 't', 'm']
     T_MIN = df['t'].min()
@@ -118,11 +115,9 @@ def samples(filepath, samples=10000, radius_km=100, time_intervals=100, random_s
 
     # Intervalos de tiempo
     time_edges = np.linspace(T_MIN, T_MAX, time_intervals + 1)
-    samples_per_interval = samples // time_intervals
-    remaining_samples = samples % time_intervals
-    
     output = pd.DataFrame(columns=['x', 'y', 'z', 't', 'm','idx_rad', 'idx_time'])
-    
+    total_samples = 0
+
     for i in range(time_intervals):
         t_start = time_edges[i]
         t_end = time_edges[i + 1]
@@ -135,46 +130,49 @@ def samples(filepath, samples=10000, radius_km=100, time_intervals=100, random_s
             print(f"Advertencia: No hay datos suficientes en el intervalo de tiempo {i+1}/{time_intervals}")
             continue
         else:
-            # distribuye equitativamente las muestras restantes
-            n_samples = samples_per_interval + (1 if i < remaining_samples else 0)
-
             # subconjuntos para este intervalo de tiempo
-            interval_subsets = generate_circular_subsets(
+            interval_subsets, quantity = generate_circular_subsets(
                 df=df_interval,
                 xlims=(X_MIN, X_MAX),
                 ylims=(Y_MIN, Y_MAX),
                 radius_km=radius_km,
-                num_subsets=n_samples,
+                num_subsets=samples_per_interval,
                 min_points_per_subset=2,
                 t_start = t_start
             )
 
             interval_subsets['idx_time'] = i
-            output = pd.concat([output, interval_subsets], ignore_index=True)
+
+            if output.empty:
+                output = interval_subsets
+            else:
+                output = pd.concat([output, interval_subsets], ignore_index=True)
+
+            total_samples += quantity
     
-    print(f"Generados {len(output)} subconjuntos en total a través de {time_intervals} intervalos de tiempo")
+    print(f"Generados {total_samples}/{time_intervals * samples_per_interval} muestras en total a través de {time_intervals} intervalos de tiempo")
     return output
 
 def main():
     parser = argparse.ArgumentParser(description="Generar muestras")
     parser.add_argument('filepath', help='Ruta al archivo CSV con datos de terremotos')
-    parser.add_argument('samples', type=int, help='Número de muestras a generar')
+    parser.add_argument('samples_per_interval', type=int, help='Número maximo de muestras a generar por intervalo de tiempo')
     parser.add_argument('radius_km', type=int, help='Radio en kilómetros para subconjuntos circulares')
     parser.add_argument('time_intervals', type=int, help='Número de intervalos de tiempo en los que dividir los datos')
     args = parser.parse_args()
 
     # Generar subconjuntos
-    subsets = samples(
+    data = samples(
         filepath=args.filepath,
-        samples=args.samples,
+        samples_per_interval=args.samples_per_interval,
         radius_km=args.radius_km,
         time_intervals=args.time_intervals
     )
 
     # Guardar subconjuntos en archivo
-    output_filename = f'{args.filepath.split(".")[0]}_{args.samples}_{args.radius_km}_{args.time_intervals}.pt'
-    print(f"Generados {len(subsets)} subconjuntos")
-    save_samples(output_filename, subsets)
+    output_filename = f'{args.filepath.split(".")[0]}_{args.samples_per_interval}_{args.radius_km}_{args.time_intervals}.csv'
+    
+    data.to_csv(output_filename, index=False)
     print(f"El nombre del archivo de salida sería: {output_filename}")
 
 if __name__ == "__main__":

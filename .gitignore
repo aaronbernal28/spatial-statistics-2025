@@ -208,3 +208,5 @@ __marimo__/
 data/query_train.csv
 data/test_earthquakes.csv
 data/query_test_100_100_2.pt
+data/query_train_200_200_1042.csv
+radius_50_100_200_400.png
