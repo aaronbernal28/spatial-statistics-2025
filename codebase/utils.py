@@ -4,7 +4,7 @@ from typing import List
 import pandas as pd
 import types
 
-def load(filename: str):
+def load_samples(filename: str):
     import sys
 
     # Create codebase package
@@ -21,7 +21,7 @@ def load(filename: str):
     codebase.utils = codebase_utils
     return torch.load(filename, weights_only=False)
 
-def save(filename: str, list_samples: List[pd.DataFrame]):
+def save_samples(filename: str, list_samples: List[pd.DataFrame]):
     processed_samples = []
     
     for df in list_samples:

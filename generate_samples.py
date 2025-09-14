@@ -1,10 +1,15 @@
 import argparse
+import random
 import numpy as np
 import pandas as pd
-from codebase.subsets import generate_circular_subsets
-from codebase.utils import save
+from codebase.utils import save_samples
+from shapely.geometry import Point
+from shapely.ops import transform
+import pyproj
+import random
+from typing import List, Tuple
 import torch
-from typing import List
+
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 Y_MIN = -40.98
@@ -12,11 +17,98 @@ Y_MAX = -12.983
 X_MIN = -79.805
 X_MAX = -62.402
 
-def samples(filepath, samples=10000, radius_km=100, time_intervals=100):
+def generate_circular_subsets(df: pd.DataFrame, 
+                              x_col = 'x', y_col = 'y', z_col = 'z', t_col = 't', m_col = 'm',
+                              xlims: Tuple[float, float] = None, ylims: Tuple[float, float] = None,
+                              radius_km: float = 10.0,
+                              num_subsets: int = 5,
+                              min_points_per_subset: int = 1,
+                              t_start: float = 0
+                              ) -> List[pd.DataFrame]:
+    """
+    Inputs:
+    df : pd.DataFrame
+    xlims : (min_lon, max_lon)
+    ylims : (min_lat, max_lat)
+    radius_km : float
+    num_subsets : int
+    min_points_per_subset : int
+
+    Output: List[pd.DataFrame] cada DataFrame contiene eventos dentro de un circunferencia aleatoria
+    """
+
+    # Bounding box
+    if xlims is None:
+        xlims = (df[x_col].min(), df[x_col].max())
+    if ylims is None:
+        ylims = (df[y_col].min(), df[y_col].max())
+    
+    # Crea Shapely
+    points_geo = [Point(lon, lat) for lon, lat in zip(df[x_col], df[y_col])]
+    
+    # Utiliza el centro para determinar la zona UTM apropiada
+    center_lon = (xlims[0] + xlims[1]) / 2
+    center_lat = (ylims[0] + ylims[1]) / 2
+    
+    # Define y proyecta a zona UTM 
+    utm_zone = int((center_lon + 180) / 6) + 1
+    hemisphere = 'north' if center_lat >= 0 else 'south'
+
+    wgs84 = pyproj.CRS('EPSG:4326')  # WGS84 (lat/lon)
+    utm = pyproj.CRS(f'+proj=utm +zone={utm_zone} +{hemisphere} +ellps=WGS84 +datum=WGS84 +units=m +no_defs')
+    project_to_utm = pyproj.Transformer.from_crs(wgs84, utm, always_xy=True).transform
+    points_utm = [transform(project_to_utm, point) for point in points_geo]
+    
+    output = []
+    attempts = 0
+    max_attempts = num_subsets * 10  # Cota superior
+    
+    while len(output) < num_subsets and attempts < max_attempts:
+        attempts += 1
+        
+        # Generar un punto central aleatorio dentro de los límites
+        center_lon = random.uniform(xlims[0], xlims[1])
+        center_lat = random.uniform(ylims[0], ylims[1])
+        center_geo = Point(center_lon, center_lat)
+        
+        # Transformar centro a zona UTM
+        center_utm = transform(project_to_utm, center_geo)
+        
+        # Crea la circunferencia
+        radius_m = radius_km * 1000
+        circle_utm = center_utm.buffer(radius_m)
+        
+        # Filtra
+        indices_in_circle = []
+        for i, point_utm in enumerate(points_utm):
+            if circle_utm.contains(point_utm):
+                indices_in_circle.append(i)
+        
+        if len(indices_in_circle) >= min_points_per_subset:
+            subset_df = df.iloc[indices_in_circle].copy()
+            
+            # Tiempo relativo al t_start
+            subset_df[t_col] = subset_df[t_col] - t_start
+            
+            output.append(subset_df)
+    
+    if len(output) < num_subsets:
+        print(f"Warning: Only generated {len(output)} subsets out of {num_subsets} requested.")
+        print(f"Consider increasing the area bounds, decreasing radius, or lowering min_points_per_subset.")
+    
+    return output
+
+def samples(filepath, samples=10000, radius_km=100, time_intervals=100, random_seed = 28):
     '''
     Genera *samples* muestras tomadas al azar de radio 10 dentro del bounding box
-    output: list[pd.DataFrame]
+    los intervalos de tiempo son disjuntos
+    en cada intervalo de tiempo puede existir interseccion
+    output: pd.DataFrame: ['x', 'y', 'z', 't', 'm', 'idx_rad', 'idx_time']
     '''
+    
+    random.seed(random_seed)
+    np.random.seed(random_seed)
+    
     df = pd.read_csv(filepath)
     df['time'] = pd.to_numeric(pd.to_datetime(df["time"])) / 10**9 # ns a s
     df = df[['longitude', 'latitude', 'depth', 'time', 'mag']]
@@ -24,14 +116,12 @@ def samples(filepath, samples=10000, radius_km=100, time_intervals=100):
     T_MIN = df['t'].min()
     T_MAX = df['t'].max()
 
-    subsets = []
-
     # Intervalos de tiempo
     time_edges = np.linspace(T_MIN, T_MAX, time_intervals + 1)
     samples_per_interval = samples // time_intervals
     remaining_samples = samples % time_intervals
     
-    subsets = []
+    output = pd.DataFrame(columns=['x', 'y', 'z', 't', 'm','idx_rad', 'idx_time'])
     
     for i in range(time_intervals):
         t_start = time_edges[i]
@@ -44,11 +134,11 @@ def samples(filepath, samples=10000, radius_km=100, time_intervals=100):
         if len(df_interval) <= 1:
             print(f"Advertencia: No hay datos suficientes en el intervalo de tiempo {i+1}/{time_intervals}")
             continue
-        
-        n_samples = samples_per_interval + (1 if i < remaining_samples else 0)
-        
-        # subconjuntos para este intervalo de tiempo
-        if len(df_interval) >= 2:
+        else:
+            # distribuye equitativamente las muestras restantes
+            n_samples = samples_per_interval + (1 if i < remaining_samples else 0)
+
+            # subconjuntos para este intervalo de tiempo
             interval_subsets = generate_circular_subsets(
                 df=df_interval,
                 xlims=(X_MIN, X_MAX),
@@ -56,56 +146,14 @@ def samples(filepath, samples=10000, radius_km=100, time_intervals=100):
                 radius_km=radius_km,
                 num_subsets=n_samples,
                 min_points_per_subset=2,
-                random_seed=None,
                 t_start = t_start
             )
-            subsets.extend(interval_subsets)
 
-            # Agregar metadatos del intervalo de tiempo a cada subconjunto
-            for subset in interval_subsets:
-                subset.attrs.update({
-                    'time_interval': i + 1,
-                    'time_start': t_start,
-                    'time_end': t_end,
-                    'total_time_intervals': time_intervals
-                })
+            interval_subsets['idx_time'] = i
+            output = pd.concat([output, interval_subsets], ignore_index=True)
     
-    print(f"Generados {len(subsets)} subconjuntos en total a través de {time_intervals} intervalos de tiempo")
-    print(f"Promedio de subconjuntos por intervalo: {len(subsets) / time_intervals:.1f}")
-
-    return subsets
-
-def show_subset_metadata_example(subsets: list[pd.DataFrame]) -> None:
-    '''
-    Mostrar qué metadatos están almacenados en subset.attrs
-    '''
-    if not subsets:
-        print("No hay subconjuntos disponibles")
-        return
-        
-    print("=== ESTRUCTURA DE METADATOS DEL SUBCONJUNTO ===")
-    print("Tipo de subconjuntos:", type(subsets))
-    print("Tipo de cada subconjunto:", type(subsets[0]) if subsets else "N/A")
-    print()
-    
-    for i, subset in enumerate(subsets[:3]):  # Mostrar los primeros 3 ejemplos
-        print(f"--- Subconjunto {i+1} ---")
-        print("Forma del DataFrame:", subset.shape)
-        print("Columnas del DataFrame:", list(subset.columns))
-        print("Tipo de attrs:", type(subset.attrs))
-        print("Contenidos de attrs:")
-        for key, value in subset.attrs.items():
-            print(f"  {key}: {value} ({type(value).__name__})")
-        print()
-        
-        # Mostrar cómo acceder a metadatos específicos
-        print("Ejemplo de acceso:")
-        print(f"  Centro del círculo: ({subset.attrs.get('circle_center_lon')}, {subset.attrs.get('circle_center_lat')})")
-        print(f"  Intervalo de tiempo: {subset.attrs.get('time_interval')}")
-        print(f"  Rango de tiempo: {subset.attrs.get('time_start')} a {subset.attrs.get('time_end')}")
-        print(f"  Radio: {subset.attrs.get('radius_km')} km")
-        print(f"  Puntos en el subconjunto: {subset.attrs.get('num_points')}")
-        print("=" * 50)
+    print(f"Generados {len(output)} subconjuntos en total a través de {time_intervals} intervalos de tiempo")
+    return output
 
 def main():
     parser = argparse.ArgumentParser(description="Generar muestras")
@@ -126,60 +174,14 @@ def main():
     # Guardar subconjuntos en archivo
     output_filename = f'{args.filepath.split(".")[0]}_{args.samples}_{args.radius_km}_{args.time_intervals}.pt'
     print(f"Generados {len(subsets)} subconjuntos")
+    save_samples(output_filename, subsets)
     print(f"El nombre del archivo de salida sería: {output_filename}")
-    save(output_filename, subsets)
-
-def run_test_example():
-    """Ejecutar ejemplo de prueba cuando no se proporcionan argumentos de línea de comandos"""
-    test_file = 'data/test_earthquakes.csv'
-    
-    # Verificar si el archivo de prueba existe
-    try:
-        # Leer archivo de prueba para obtener rangos de datos para depuración
-        test_df = pd.read_csv(test_file)
-        print(f"Usando archivo de prueba existente: {test_file}")
-        
-        # Usar la función samples()
-        print("\n=== Usando la función samples() ===")
-        subsets = samples(
-            filepath=test_file,
-            samples=50,           # Generar 50 subconjuntos circulares
-            radius_km=100,        # Círculos de radio 100km  
-            time_intervals=5      # A través de 5 intervalos de tiempo
-        )
-        
-        print(f"\nGenerados {len(subsets)} subconjuntos")
-        
-        # Mostrar metadatos detallados para los primeros subconjuntos
-        print("\n" + "="*60)
-        show_subset_metadata_example(subsets)
-        
-        # Mostrar cómo acceder a datos de subconjuntos individuales
-        if subsets:
-            print(f"\n=== Ejemplo: Accediendo al primer subconjunto ===")
-            first_subset = subsets[0]
-            print(f"Forma del subconjunto: {first_subset.shape}")
-            print(f"Rango de tiempo en el subconjunto: {first_subset['t'].min():.0f} a {first_subset['t'].max():.0f}")
-            print(f"Rango de magnitud: {first_subset['m'].min():.2f} a {first_subset['m'].max():.2f}")
-            print(f"Centro geográfico: ({first_subset.attrs['circle_center_lon']:.3f}, {first_subset.attrs['circle_center_lat']:.3f})")
-            print(f"Intervalo de tiempo: {first_subset.attrs['time_interval']}/{first_subset.attrs['total_time_intervals']}")
-        
-        # También imprimir información de depuración
-        print(f"\n=== INFORMACIÓN DE DEPURACIÓN ===")
-        print(f"Caja delimitadora: X({X_MIN}, {X_MAX}), Y({Y_MIN}, {Y_MAX})")
-        print(f"Rangos de datos de prueba: lon({test_df['longitude'].min():.2f}, {test_df['longitude'].max():.2f}), lat({test_df['latitude'].min():.2f}, {test_df['latitude'].max():.2f})")
-        
-    except FileNotFoundError:
-        print(f"Archivo de prueba {test_file} no encontrado. Por favor créalo primero o proporciona argumentos de línea de comandos.")
 
 if __name__ == "__main__":
     import sys
     
     # Verificar si se proporcionan argumentos de línea de comandos
     if len(sys.argv) > 1:
-        # Usar interfaz de línea de comandos
         main()
     else:
-        # Ejecutar ejemplo de prueba
-        print("No se proporcionaron argumentos de línea de comandos. Ejecutando ejemplo de prueba...")
-        run_test_example()
+        print("No se proporcionaron argumentos de línea de comandos.")
